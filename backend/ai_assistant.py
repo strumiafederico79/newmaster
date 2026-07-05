@@ -617,7 +617,10 @@ def _parse_instruction_params(user_message: str) -> dict:
     def add_param(key, value):
         if value is None:
             return
-        params[key] = round(float(value), 4)
+        if isinstance(value, str):
+            params[key] = value
+        else:
+            params[key] = round(float(value), 4)
 
     # --- Gain / level parsing ---
     gain_match = re.search(r'([+-]?\d+(?:[.,]\d+)?)\s*(?:db|dB|decibeles|decibel)', message)
@@ -723,6 +726,35 @@ def _parse_instruction_params(user_message: str) -> dict:
         if gain_db is not None:
             add_param("comp_makeup_db", gain_db)
             summary = summary or "Ajuste de loudness"
+
+    # --- Parámetros avanzados / modos de cadena ---
+    if "linear phase" in message or "phase linear" in message or "linear_phase" in message:
+        add_param("eq_mode", "linear_phase")
+    if "iir" in message:
+        add_param("eq_mode", "iir")
+    if "glue" in message and ("bypass" in message or "desactiv" in message or "apag" in message):
+        add_param("glue_bypass", True)
+    if "glue" in message and ("activar" in message or "encend" in message or "on" in message):
+        add_param("glue_bypass", False)
+    if "multibanda" in message and ("bypass" in message or "desactiv" in message or "apag" in message):
+        add_param("mb_bypass", True)
+    if "multibanda" in message and ("activar" in message or "encend" in message or "on" in message):
+        add_param("mb_bypass", False)
+    if "estéreo" in message and ("enhancer" in message or "estereo enhancer" in message):
+        add_param("use_stereo_enhancer", True)
+    if "enhancer" in message and ("bypass" in message or "desactiv" in message or "apag" in message):
+        add_param("use_stereo_enhancer", False)
+    if "link" in message and "stereo" in message and ("activar" in message or "on" in message):
+        add_param("comp_stereo_link", True)
+    if "link" in message and "stereo" in message and ("desactiv" in message or "apag" in message):
+        add_param("comp_stereo_link", False)
+    if "oversample" in message or "oversampling" in message:
+        if "bajo" in message or "draft" in message or "fast" in message or "rapido" in message:
+            add_param("oversample_mode", "fast")
+        elif "alta" in message or "quality" in message or "calidad" in message or "ultra" in message:
+            add_param("oversample_mode", "quality")
+        else:
+            add_param("oversample_mode", "quality")
 
     return params if params else {}
 

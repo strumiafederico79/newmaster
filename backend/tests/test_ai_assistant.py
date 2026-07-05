@@ -39,3 +39,12 @@ def test_eq_instruction_is_parsed_into_parameter_changes():
     assert params["eq4_gain"] == -2.0
     assert params["eq4_freq"] == 4000.0
     assert params["eq4_q"] == 1.2
+
+
+def test_advanced_dsp_mode_is_exposed_to_the_assistant():
+    analysis = {}
+
+    result = build_fallback_response("usa linear phase para la eq", analysis)
+
+    params = result["suggested_params"]
+    assert params["eq_mode"] == "linear_phase"
