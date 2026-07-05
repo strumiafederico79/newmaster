@@ -617,7 +617,9 @@ def _parse_instruction_params(user_message: str) -> dict:
     def add_param(key, value):
         if value is None:
             return
-        if isinstance(value, str):
+        if isinstance(value, bool):
+            params[key] = value
+        elif isinstance(value, str):
             params[key] = value
         else:
             params[key] = round(float(value), 4)
