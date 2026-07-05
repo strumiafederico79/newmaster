@@ -4,6 +4,8 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>MASTER — Audio Mastering Studio</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uppy/dist/uppy.min.css" />
+<script src="https://cdn.jsdelivr.net/npm/uppy/dist/uppy.min.js"></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
 
@@ -37,6 +39,10 @@
   .drop-zone p{color:var(--muted);font-size:.85rem}
   .drop-zone .file-name{color:var(--green);font-family:var(--mono);font-size:.8rem;margin-top:.5rem;word-break:break-all}
   .file-size-warn{color:var(--yellow);font-size:.75rem;margin-top:.3rem;font-family:var(--mono)}
+  .uppy-picker{margin-top:.7rem;display:flex;justify-content:center}
+  .uppy-picker .uppy-FileInput-container{width:100%}
+  .uppy-picker .uppy-FileInput-btn{width:100%;padding:.55rem .75rem;border:1px solid var(--border);border-radius:8px;background:var(--surface2);color:var(--text);font-family:var(--sans);font-size:.76rem;cursor:pointer}
+  .uppy-picker .uppy-FileInput-btn:hover{border-color:var(--accent)}
 
   .param{display:grid;grid-template-columns:1fr auto;gap:.25rem;margin-bottom:.9rem}
   .param label{font-size:.8rem;color:var(--text)}
@@ -339,6 +345,7 @@
         <input type="file" id="fileInput" accept=".wav,.mp3,.flac,.ogg,.aiff,.aif" />
         <div class="icon">🎵</div>
         <p>Arrastrá tu audio aquí<br/><small>WAV · MP3 · FLAC · OGG · AIFF — máx 50 MB</small></p>
+        <div class="uppy-picker" id="uppyPicker"></div>
         <div class="file-name" id="fileName"></div>
         <div class="file-size-warn" id="fileSizeWarn"></div>
       </div>
@@ -993,6 +1000,23 @@ document.getElementById('s-platform').addEventListener('change', schedulePreview
 // ── File handling ────────────────────────────────────────────────────────────
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
+let uppy = null;
+if (window.Uppy && window.Uppy.Uppy && window.Uppy.FileInput) {
+  fileInput.style.pointerEvents = 'none';
+  uppy = new window.Uppy.Uppy({
+    autoProceed: false,
+    allowMultipleUploads: false,
+    restrictions: { maxNumberOfFiles: 1, allowedFileTypes: ['audio/*'] }
+  });
+  uppy.use(window.Uppy.FileInput, { target: '#uppyPicker', pretty: true, locale: { filesSelected: { 0: 'Elegir archivo', 1: '1 archivo seleccionado' } } });
+  uppy.on('file-added', file => {
+    if (file && file.data) setFile(file.data);
+  });
+  uppy.on('files-added', files => {
+    const picked = Object.values(files || {}).find(f => f && f.data);
+    if (picked && picked.data) setFile(picked.data);
+  });
+}
 dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('dragover')});
 dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('dragover'));
 dropZone.addEventListener('drop',e=>{e.preventDefault();dropZone.classList.remove('dragover');if(e.dataTransfer.files[0])setFile(e.dataTransfer.files[0])});
