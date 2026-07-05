@@ -33,6 +33,8 @@ os.makedirs(PROCESSED_DIR, exist_ok=True)
 jobs: dict = {}
 
 def validate_audio_file(filename: str) -> None:
+    if not filename or not isinstance(filename, str):
+        raise HTTPException(400, "Nombre de archivo inválido o faltante.")
     ext = os.path.splitext(filename)[-1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(400, f"Formato '{ext}' no soportado. Válidos: {sorted(ALLOWED_EXTENSIONS)}")
