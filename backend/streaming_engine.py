@@ -8,64 +8,105 @@ import numpy as np
 from mastering import apply_mastering_chain, measure_lufs_integrated, stereo_correlation
 
 CHUNK_SECONDS_DEFAULT = 2.0
+DEFAULT_OVERLAP_SECONDS = 0.02
 
 
 def iter_mastering_chunks(audio: np.ndarray, sr: int,
                           chunk_seconds: float = CHUNK_SECONDS_DEFAULT,
+                          overlap_seconds: float = DEFAULT_OVERLAP_SECONDS,
                           **chain_params):
     """
     Yields (processed_block, metrics_dict) for each chunk.
-    metrics_dict now includes gain-reduction data from chain_meters for las
-    tres etapas de dinámica (multibanda, banda ancha, glue) más el snapshot
-    VU pre/post limiter.
+
+    Para reducir artefactos entre bloques, el motor procesa cada chunk con un
+    pequeño contexto del chunk anterior (solapamiento temporal). Esto mejora la
+    continuidad del procesamiento sin cambiar la API pública.
     """
-    total_samples = audio.shape[-1]
+    if audio is None:
+        return
+
+    if audio.ndim == 1:
+        audio_2d = audio[np.newaxis, :]
+        input_is_mono = True
+    elif audio.ndim == 2:
+        audio_2d = audio
+        input_is_mono = False
+    else:
+        raise ValueError("audio debe ser mono o estéreo (1D/2D)")
+
+    total_samples = int(audio_2d.shape[-1])
     chunk_samples = max(1, int(chunk_seconds * sr))
+    overlap_samples = max(0, int(overlap_seconds * sr))
+    overlap_samples = min(overlap_samples, max(1, chunk_samples // 2))
     n_chunks = int(np.ceil(total_samples / chunk_samples))
+
+    context = np.zeros((audio_2d.shape[0], overlap_samples), dtype=np.float32)
 
     for i in range(n_chunks):
         start = i * chunk_samples
-        end   = min(start + chunk_samples, total_samples)
-        block = audio[:, start:end] if audio.ndim == 2 else audio[start:end]
+        end = min(start + chunk_samples, total_samples)
+        block = audio_2d[:, start:end]
         if block.shape[-1] == 0:
             continue
 
-        # apply_mastering_chain now returns (audio, chain_meters)
-        processed, chain_meters = apply_mastering_chain(block, sr, **chain_params)
+        block = np.asarray(block, dtype=np.float32)
+        if overlap_samples > 0 and context.shape[-1] > 0:
+            combined = np.concatenate([context, block], axis=1)
+        else:
+            combined = block
 
-        mono     = processed.mean(axis=0) if processed.ndim == 2 else processed
-        peak     = float(np.max(np.abs(mono))) if mono.size else 0.0
-        rms      = float(np.sqrt(np.mean(mono ** 2))) if mono.size else 0.0
-        peak_db  = float(20.0 * np.log10(peak + 1e-9))
-        rms_db   = float(20.0 * np.log10(rms  + 1e-9))
+        processed, chain_meters = apply_mastering_chain(combined, sr, **chain_params)
+        processed = np.asarray(processed, dtype=np.float32)
+
+        if overlap_samples > 0 and processed.shape[-1] > overlap_samples:
+            out_block = processed[:, overlap_samples:overlap_samples + block.shape[-1]]
+        else:
+            out_block = processed[:, :block.shape[-1]]
+
+        if out_block.shape[-1] < block.shape[-1]:
+            pad = np.zeros((out_block.shape[0], block.shape[-1] - out_block.shape[-1]), dtype=np.float32)
+            out_block = np.concatenate([out_block, pad], axis=1)
+
+        if input_is_mono:
+            out_block = out_block[0]
+
+        mono = out_block.mean(axis=0) if out_block.ndim == 2 else out_block
+        mono = np.asarray(mono, dtype=np.float32)
+        peak = float(np.max(np.abs(mono))) if mono.size else 0.0
+        rms = float(np.sqrt(np.mean(mono ** 2))) if mono.size else 0.0
+        peak_db = float(20.0 * np.log10(peak + 1e-9)) if peak > 0.0 else -120.0
+        rms_db = float(20.0 * np.log10(rms + 1e-9)) if rms > 0.0 else -120.0
 
         try:
-            lufs_chunk = measure_lufs_integrated(processed, sr)
+            lufs_chunk = measure_lufs_integrated(out_block, sr)
+            if not np.isfinite(lufs_chunk):
+                raise ValueError("LUFS no finito")
         except Exception:
             lufs_chunk = rms_db - 0.691
 
-        # Stereo correlation
-        corr = stereo_correlation(processed)
+        try:
+            corr = stereo_correlation(out_block)
+        except Exception:
+            corr = 0.0
 
         metrics = {
-            "chunk_index":        i,
-            "n_chunks":           n_chunks,
-            "progress_pct":       round(((i + 1) / n_chunks) * 100.0, 1),
-            "peak_db":            round(peak_db, 2),
-            "rms_db":             round(rms_db, 2),
-            "lufs_momentary":     round(lufs_chunk, 2),
+            "chunk_index": i,
+            "n_chunks": n_chunks,
+            "progress_pct": round(((i + 1) / n_chunks) * 100.0, 1),
+            "peak_db": round(peak_db, 2),
+            "rms_db": round(rms_db, 2),
+            "lufs_momentary": round(lufs_chunk, 2),
             "stereo_correlation": round(corr, 3),
-            "time_sec":           round(start / sr, 2),
-            # Multiband compressor gain-reduction metering for front-end rendering
+            "time_sec": round(start / sr, 2),
             "mb_meters": chain_meters.get("mb", {}),
-            # Compresor de banda ancha ("Dinámica") y glue compressor
             "comp_meters": chain_meters.get("comp", {}),
             "glue_meters": chain_meters.get("glue", {}),
-            # Pre/post limiter VU snapshot
-            "pre_limiter":        chain_meters.get("pre_limiter", {}),
-            "post_limiter":       chain_meters.get("post_limiter", {}),
+            "pre_limiter": chain_meters.get("pre_limiter", {}),
+            "post_limiter": chain_meters.get("post_limiter", {}),
         }
-        yield processed, metrics
+
+        context = block[:, -overlap_samples:] if overlap_samples > 0 else np.zeros((block.shape[0], 0), dtype=np.float32)
+        yield out_block, metrics
 
 
 def master_stream_to_pcm16(audio: np.ndarray, sr: int,
