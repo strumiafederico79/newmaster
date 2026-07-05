@@ -300,11 +300,13 @@
     font-family:var(--mono);color:var(--text)}
   .ai-suggestion-param{color:var(--muted)}
   .ai-suggestion-value{color:var(--text);font-weight:600;text-align:right}
-  .ai-suggestion-card-actions{display:flex;justify-content:flex-end}
-  .ai-suggestion-apply-btn{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;
-    border:none;border-radius:8px;padding:.4rem .9rem;font-size:.76rem;font-weight:600;cursor:pointer}
+  .ai-suggestion-card-actions{display:flex;justify-content:flex-end;gap:.45rem;flex-wrap:wrap}
+  .ai-suggestion-apply-btn,.ai-suggestion-cancel-btn{border:none;border-radius:8px;padding:.4rem .9rem;font-size:.76rem;font-weight:600;cursor:pointer}
+  .ai-suggestion-apply-btn{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+  .ai-suggestion-cancel-btn{background:var(--surface3);color:var(--text);border:1px solid var(--border)}
   .ai-suggestion-apply-btn:hover{filter:brightness(1.08)}
-  .ai-suggestion-apply-btn:disabled{cursor:default;filter:none;opacity:.7}
+  .ai-suggestion-cancel-btn:hover{background:var(--surface2)}
+  .ai-suggestion-apply-btn:disabled,.ai-suggestion-cancel-btn:disabled{cursor:default;filter:none;opacity:.7}
   .ai-suggestion-btn{background:var(--surface2);border:1px solid var(--border);color:var(--muted);
     border-radius:999px;padding:.35rem .7rem;font-size:.68rem;font-family:var(--sans);cursor:pointer;transition:border-color .15s,color .15s}
   .ai-suggestion-btn:hover{border-color:var(--accent);color:var(--accent)}
@@ -2385,15 +2387,24 @@ function aiAppendSuggestionCard(suggestedParams, summary) {
   const actions = document.createElement('div');
   actions.className = 'ai-suggestion-card-actions';
 
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'ai-suggestion-cancel-btn';
+  cancelBtn.textContent = 'Cancelar';
+  cancelBtn.addEventListener('click', () => {
+    card.remove();
+  });
+  actions.appendChild(cancelBtn);
+
   const applyBtn = document.createElement('button');
   applyBtn.className = 'ai-suggestion-apply-btn';
-  applyBtn.textContent = 'Aplicar cambios';
+  applyBtn.textContent = 'Confirmar cambios';
   applyBtn.addEventListener('click', () => {
     applyPresetToUI(suggestedParams);
     activePreset = null;
     document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
     applyBtn.textContent = '✓ Aplicado';
     applyBtn.disabled = true;
+    cancelBtn.disabled = true;
     card.classList.add('applied');
   });
   actions.appendChild(applyBtn);
