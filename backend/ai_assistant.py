@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import logging
+import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -239,7 +240,12 @@ def chat(user_message: str, history: Optional[list] = None,
     """
     client = _get_client()
     if client is None:
-        raise RuntimeError(get_unavailable_reason())
+        fallback = build_fallback_response(user_message, analysis)
+        return {
+            "reply": fallback["reply"],
+            "suggested_params": fallback["suggested_params"],
+            "suggestion_summary": fallback["suggestion_summary"],
+        }
 
     if not user_message or not user_message.strip():
         raise ValueError("El mensaje está vacío.")
@@ -309,10 +315,11 @@ def chat(user_message: str, history: Optional[list] = None,
                 pass
 
     if not data:
+        fallback = build_fallback_response(user_message, analysis)
         return {
-            "reply": "No obtuve respuesta del modelo. Probá reformular la pregunta.",
-            "suggested_params": {},
-            "suggestion_summary": None,
+            "reply": fallback["reply"],
+            "suggested_params": fallback["suggested_params"],
+            "suggestion_summary": fallback["suggestion_summary"],
         }
 
     reply_text = str(data.get("reply") or "").strip() or (
@@ -588,6 +595,229 @@ def _clamp(value, lo, hi):
     except (TypeError, ValueError):
         return None
     return max(lo, min(hi, value))
+
+
+def _parse_instruction_params(user_message: str) -> dict:
+    """Traduce instrucciones en lenguaje natural a parámetros de la cadena DSP.
+
+    Ejemplos soportados:
+    - 'dame 2 db menos en 4k q 1.2' -> EQ banda 3 con gain -2 dB, freq 4k, Q 1.2
+    - 'subí 1.5 dB el aire' -> high_shelf_gain_db +1.5
+    - 'más compresión' -> comp_ratio/comp_threshold más agresivos
+    - 'más reverb' -> reverb_wet +0.04
+    """
+    message = (user_message or "").strip().lower()
+    if not message:
+        return {}
+
+    params: dict = {}
+    summary = None
+    reply = None
+
+    def add_param(key, value):
+        if value is None:
+            return
+        params[key] = round(float(value), 4)
+
+    # --- Gain / level parsing ---
+    gain_match = re.search(r'([+-]?\d+(?:[.,]\d+)?)\s*(?:db|dB|decibeles|decibel)', message)
+    gain_db = None
+    if gain_match:
+        gain_db = float(gain_match.group(1).replace(",", "."))
+        if re.search(r'\b(menos|bajar|bajá|bajale|restar|cut|down)\b', message):
+            gain_db = -abs(gain_db)
+        elif re.search(r'\b(subir|subi|subile|aumentar|agregar|boost|up|más)\b', message):
+            gain_db = abs(gain_db)
+
+    # --- Frequency parsing ---
+    freq_hz = None
+    freq_match = re.search(r'(\d+(?:[.,]\d+)?)\s*(k|khz|hz)', message)
+    if freq_match:
+        val = float(freq_match.group(1).replace(",", "."))
+        unit = freq_match.group(2).lower()
+        if unit in {"k", "khz"}:
+            freq_hz = val * 1000.0
+        else:
+            freq_hz = val
+
+    # --- Q parsing ---
+    q_value = None
+    q_match = re.search(r'(?:q|q=|q:|q\s*)(\d+(?:[.,]\d+)?)', message)
+    if q_match:
+        q_value = float(q_match.group(1).replace(",", "."))
+
+    # --- EQ instruction: 'en 4k', 'en 8k', '2 db menos en 4k q 1.2' ---
+    if gain_db is not None and ("eq" in message or freq_hz is not None or "4k" in message or "8k" in message or "khz" in message):
+        if freq_hz is None and gain_db is not None:
+            freq_hz = 4000.0 if "4k" in message or "4 khz" in message else 8000.0 if "8k" in message or "8 khz" in message else None
+        if freq_hz is not None:
+            if freq_hz <= 180.0:
+                band_key = "eq1"
+            elif freq_hz <= 1000.0:
+                band_key = "eq2"
+            elif freq_hz <= 3000.0:
+                band_key = "eq3"
+            else:
+                band_key = "eq4"
+            add_param(f"{band_key}_freq", freq_hz)
+            add_param(f"{band_key}_gain", gain_db)
+            if q_value is not None:
+                add_param(f"{band_key}_q", q_value)
+            summary = "Ajuste de EQ paramétrico"
+            reply = f"Ajusté la banda de EQ en {int(freq_hz/1000)} kHz con {gain_db:+.1f} dB."
+
+    # --- Shelf / air / brilliance ---
+    if gain_db is not None and ("aire" in message or "brillo" in message or "agudos" in message or "high shelf" in message):
+        add_param("high_shelf_gain_db", gain_db)
+        if summary is None:
+            summary = "Ajuste de aire en agudos"
+            reply = f"Subí el shelf de agudos en {gain_db:+.1f} dB."
+
+    # --- Compression controls ---
+    if "compres" in message or "compress" in message or "compression" in message:
+        if gain_db is not None and ("threshold" in message or "umbral" in message or "thresh" in message):
+            add_param("comp_threshold", _db_to_linear(gain_db))
+            summary = summary or "Ajuste de compresión"
+            reply = reply or f"Cambié el threshold del compresor a {gain_db:+.1f} dB."
+        elif "ratio" in message or "ratio" in message:
+            ratio_match = re.search(r'(\d+(?:[.,]\d+)?)\s*(?:x|:1|ratio)', message)
+            if ratio_match:
+                add_param("comp_ratio", float(ratio_match.group(1).replace(",", ".")))
+                summary = summary or "Ajuste de ratio"
+        elif "attack" in message or "ataque" in message:
+            ms_match = re.search(r'(\d+(?:[.,]\d+)?)\s*(ms|miliseg)', message)
+            if ms_match:
+                add_param("comp_attack_ms", float(ms_match.group(1).replace(",", ".")))
+        elif "release" in message or "release" in message or "soltar" in message:
+            ms_match = re.search(r'(\d+(?:[.,]\d+)?)\s*(ms|miliseg)', message)
+            if ms_match:
+                add_param("comp_release_ms", float(ms_match.group(1).replace(",", ".")))
+
+    # --- Saturation ---
+    if "satur" in message or "drive" in message:
+        if gain_db is not None:
+            add_param("saturation_drive", max(0.0, min(1.0, abs(gain_db) / 12.0)))
+            summary = summary or "Ajuste de saturación"
+
+    # --- Stereo / width ---
+    if "ancho" in message or "estéreo" in message or "width" in message:
+        width_match = re.search(r'(\d+(?:[.,]\d+)?)\s*(x|times)', message)
+        if width_match:
+            add_param("stereo_width_amount", float(width_match.group(1).replace(",", ".")))
+        elif gain_db is not None:
+            add_param("stereo_width_amount", max(0.0, min(3.0, 1.0 + gain_db / 6.0)))
+
+    # --- Reverb ---
+    if "reverb" in message or "verb" in message:
+        if gain_db is not None:
+            add_param("reverb_wet", max(0.0, min(1.0, abs(gain_db) / 12.0)))
+        else:
+            add_param("reverb_wet", 0.08)
+
+    # --- Limiter / ceiling / loudness ---
+    if "limiter" in message or "techo" in message or "pico" in message:
+        if gain_db is not None:
+            add_param("limiter_ceiling", _db_to_linear(gain_db))
+            summary = summary or "Ajuste de limiter"
+    if "loud" in message or "lufs" in message or "fuerte" in message or "más fuerte" in message:
+        if gain_db is not None:
+            add_param("comp_makeup_db", gain_db)
+            summary = summary or "Ajuste de loudness"
+
+    return params if params else {}
+
+
+def build_fallback_response(user_message: str, analysis: Optional[dict]) -> dict:
+    """Respuesta de respaldo útil cuando la IA externa no está disponible o no
+    devuelve cambios accionables. Genera sugerencias simples pero realistas basadas
+    en el análisis y en palabras claves del mensaje del usuario."""
+    message = (user_message or "").strip().lower()
+    parsed_params = _parse_instruction_params(user_message)
+    if parsed_params:
+        return {
+            "reply": f"Aplicaré ese ajuste directamente en la cadena DSP: {', '.join(parsed_params.keys())}.",
+            "suggested_params": parsed_params,
+            "suggestion_summary": "Ajuste DSP guiado por texto",
+        }
+
+    a = analysis or {}
+    spectrum = a.get("spectrum") or {}
+    advice = a.get("mix_advice") or {}
+    issues = [str(i).lower() for i in (advice.get("issues") or [])]
+    tips = [str(t).lower() for t in (advice.get("tips") or [])]
+    lufs = a.get("lufs")
+    peak = a.get("peak_db")
+    true_peak = a.get("true_peak_db")
+
+    suggested: dict = {}
+    summary = None
+    reply = "Te propongo un ajuste conservador según el análisis del track."
+
+    def pick(value, key):
+        if value is None:
+            return
+        suggested[key] = round(float(value), 3)
+
+    wants_brighter = any(k in message for k in ["brillo", "aire", "agudos", "bright", "shine", "más brillo"])
+    wants_louder = any(k in message for k in ["más fuerte", "louder", "subilo", "subir", "loudness", "más loud"])
+    wants_less_comp = any(k in message for k in ["menos comp", "menos compresión", "suave", "más natural", "relajá"])
+    wants_more_warmth = any(k in message for k in ["calido", "warm", "grave", "graves", "bajo"])
+    wants_less_clipping = any(k in message for k in ["clipping", "pico", "techo", "limitar", "limiter"])
+
+    if wants_brighter or any("altas frecuencias muy bajas" in i for i in issues) or any("high shelf" in t for t in tips):
+        boost = 2.0 if (spectrum.get("air") is not None and float(spectrum.get("air", -999)) < -24) else 1.5
+        pick(boost, "high_shelf_gain_db")
+        pick(min(2.0, max(0.8, boost - 0.4)), "eq4_gain")
+        summary = "Más aire y brillo en agudos"
+        reply = "Voy a sumar un poco de aire en los agudos para que el track se vea más abierto y brillante."
+
+    if wants_louder or (isinstance(lufs, (int, float)) and lufs < -18):
+        if isinstance(lufs, (int, float)) and lufs < -20:
+            pick(-12.0, "target_lufs")
+            pick(1.5, "comp_makeup_db")
+            summary = summary or "Subir loudness con más control"
+            reply = "El track está bastante abajo en loudness, así que priorizo un lift de nivel con compresión y limiter más controlados."
+        else:
+            pick(-14.0, "target_lufs")
+            pick(0.8, "comp_makeup_db")
+            summary = summary or "Subir loudness sin perder cuerpo"
+            reply = "Voy a empujar un poco el nivel general para que quede más presente sin perder demasiada dinámica."
+
+    if wants_less_comp or any("muy comprimido" in i or "muy comprimido" in t for i, t in zip(issues, tips)):
+        pick(0.65, "comp_threshold")
+        pick(2.0, "comp_ratio")
+        summary = summary or "Compresión más natural"
+        reply = "Voy a aflojar un poco la compresión para que el track se sienta menos aplastado."
+
+    if wants_more_warmth or (spectrum.get("bass") is not None and float(spectrum.get("bass", -999)) < -18):
+        pick(45.0, "hp_cutoff")
+        pick(1.2, "eq1_gain")
+        summary = summary or "Más cuerpo en bajos"
+        reply = "Voy a reforzar la zona de bajos y limpiar un poco el extremo grave para que suene más sólido."
+
+    if wants_less_clipping or ((isinstance(true_peak, (int, float)) and true_peak > -0.5) or (isinstance(peak, (int, float)) and peak > -0.5)):
+        pick(0.94, "limiter_ceiling")
+        pick(50.0, "limiter_release_ms")
+        summary = summary or "Más margen de pico"
+        reply = "Voy a bajar un poco el techo del limiter para reducir riesgo de clipping y proteger la salida."
+
+    if not suggested:
+        if isinstance(lufs, (int, float)) and lufs < -18:
+            pick(-14.0, "target_lufs")
+            pick(0.8, "comp_makeup_db")
+            summary = "Subir loudness con más control"
+        elif any("pico" in i for i in issues):
+            pick(0.94, "limiter_ceiling")
+            summary = "Reducir riesgo de clipping"
+        elif any("muy bajo" in i for i in issues):
+            pick(1.0, "high_shelf_gain_db")
+            summary = "Aumentar claridad general"
+
+    return {
+        "reply": reply,
+        "suggested_params": suggested,
+        "suggestion_summary": summary,
+    }
 
 
 def _fallback_custom_params(analysis: Optional[dict]) -> dict:
