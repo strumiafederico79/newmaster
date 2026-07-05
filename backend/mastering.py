@@ -2338,7 +2338,7 @@ def process_audio(
                 break
             current_input_gain = new_input_gain
             audio_retry, chain_meters_retry = apply_mastering_chain(
-                _load_audio_any(input_path)[0] if False else audio_orig, sr,
+                audio, sr,
                 target_peak=target_peak, use_lufs_normalize=use_lufs_normalize, target_lufs=target_lufs,
                 input_gain_db=current_input_gain, oversample_mode=oversample_mode, comp_stereo_link=comp_stereo_link,
                 comp_threshold=comp_threshold, comp_ratio=comp_ratio, comp_attack_ms=comp_attack_ms,
