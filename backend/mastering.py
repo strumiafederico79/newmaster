@@ -3,8 +3,8 @@ import soundfile as sf
 import numpy as np
 import uuid
 import os
-from scipy.signal import butter, sosfilt, sosfiltfilt, fftconvolve, resample_poly, welch
-from scipy.ndimage import maximum_filter1d
+from scipy.signal import butter, sosfilt, sosfiltfilt, fftconvolve, resample_poly, welch, sosfreqz, firwin2, find_peaks
+from scipy.ndimage import maximum_filter1d, median_filter
 
 os.makedirs("processed", exist_ok=True)
 
@@ -367,6 +367,280 @@ def mid_side_process(audio: np.ndarray,
     mid  *= 10.0 ** (mid_gain_db  / 20.0)
     side *= 10.0 ** (side_gain_db / 20.0)
     return np.stack([mid + side, mid - side])
+
+def low_end_mono_maker(audio: np.ndarray, sr: int,
+                       freq: float = 120.0, mono_amount: float = 1.0) -> np.ndarray:
+    """Mono Maker de graves DEDICADO (independiente del stereo_enhancer, que
+    trae su propio bass-mono fijo). Por debajo de `freq` reduce el ancho
+    estéreo hacia mono en la proporción `mono_amount` (0 = estéreo intacto,
+    1 = mono total); por encima de `freq` no toca nada. Usa crossover
+    Butterworth 4º orden en fase cero (sosfiltfilt), igual convención que el
+    resto de la EQ. Sirve para compatibilidad mono, evitar cancelaciones de
+    fase de graves en sistemas club/vinilo, y concentrar energía de sub en
+    el centro — el pedido típico de "graves en mono <100-150 Hz".
+    """
+    if audio.ndim != 2 or audio.shape[0] != 2 or mono_amount <= 0.0:
+        return audio
+    freq = float(np.clip(freq, 20.0, sr / 2.0 - 1.0))
+    mono_amount = float(np.clip(mono_amount, 0.0, 1.0))
+    sos_lp = butter(4, freq, btype="lowpass",  fs=sr, output="sos")
+    sos_hp = butter(4, freq, btype="highpass", fs=sr, output="sos")
+    low  = sosfiltfilt(sos_lp, audio)
+    high = sosfiltfilt(sos_hp, audio)
+    low_mono = np.tile(low.mean(axis=0), (2, 1))
+    low_out  = low * (1.0 - mono_amount) + low_mono * mono_amount
+    return low_out + high
+
+# ─── Diseño de filtros RBJ (biquad) reutilizables como SOS ────────────────────
+# Extraídos como helpers independientes para poder evaluar su respuesta en
+# frecuencia (sosfreqz) y sumarla en dB al diseñar el EQ de fase lineal FIR
+# más abajo, sin duplicar/desincronizar las fórmulas de eq_parametric_band /
+# eq_high_shelf.
+
+def _design_peaking_sos(sr: int, freq: float, gain_db: float, q: float) -> np.ndarray:
+    freq = float(np.clip(freq, 20.0, sr / 2.0 - 1.0))
+    q    = float(np.clip(q, 0.1, 30.0))
+    A    = 10.0 ** (gain_db / 40.0)
+    w0   = 2.0 * np.pi * freq / sr
+    cos_w0, sin_w0 = np.cos(w0), np.sin(w0)
+    alpha = sin_w0 / (2.0 * q)
+    b0 = 1.0 + alpha * A
+    b1 = -2.0 * cos_w0
+    b2 = 1.0 - alpha * A
+    a0 = 1.0 + alpha / A
+    a1 = -2.0 * cos_w0
+    a2 = 1.0 - alpha / A
+    return np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]])
+
+def _design_high_shelf_sos(sr: int, freq: float, gain_db: float) -> np.ndarray:
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * np.pi * freq / sr
+    cos_w0, sin_w0 = np.cos(w0), np.sin(w0)
+    alpha = sin_w0 / 2.0 * np.sqrt((A + 1.0 / A) * 1.0 + 2.0)
+    sqrtA = np.sqrt(A)
+    b0 =  A * ((A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha)
+    b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos_w0)
+    b2 =  A * ((A + 1.0) + (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha)
+    a0 =       (A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha
+    a1 =  2.0 * ((A - 1.0) - (A + 1.0) * cos_w0)
+    a2 =       (A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha
+    return np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]])
+
+def _design_low_shelf_sos(sr: int, freq: float, gain_db: float) -> np.ndarray:
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * np.pi * freq / sr
+    cos_w0, sin_w0 = np.cos(w0), np.sin(w0)
+    alpha = sin_w0 / 2.0 * np.sqrt((A + 1.0 / A) * 1.0 + 2.0)
+    sqrtA = np.sqrt(A)
+    b0 =    A * ((A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha)
+    b1 =  2.0 * A * ((A - 1.0) - (A + 1.0) * cos_w0)
+    b2 =    A * ((A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha)
+    a0 =         (A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha
+    a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0)
+    a2 =         (A + 1.0) + (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha
+    return np.array([[b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0]])
+
+def linear_phase_eq(audio: np.ndarray, sr: int, bands: list, num_taps: int = 2049) -> np.ndarray:
+    """EQ de FASE LINEAL real (FIR), a diferencia de eq_parametric_band /
+    eq_high_shelf que son IIR con sosfiltfilt (fase CERO, no lineal: fase
+    cero es más fuerte que lineal pero exige procesar offline con la señal
+    completa, cosa que igual hacemos acá, así que en la práctica ya nos daba
+    fase cero). El motivo real para tener un modo FIR de fase lineal
+    dedicado es tener delay de grupo CONSTANTE y verificable en todas las
+    frecuencias (como en plugins tipo Pro-Q "Linear Phase"), útil cuando se
+    van a sumar/comparar bandas o cuando el pre-ringing controlado del FIR
+    es preferible a la respuesta IIR en cortes/boosts grandes.
+
+    bands: lista de dicts, cada uno:
+        {"type": "peak", "freq": 100.0, "gain_db": 2.0, "q": 1.0}
+        {"type": "high_shelf", "freq": 8000.0, "gain_db": 2.0}
+        {"type": "low_shelf",  "freq": 100.0,  "gain_db": 2.0}
+    Se combinan TODAS las bandas en una sola curva de magnitud (suma en dB),
+    y de ahí se diseña UN solo FIR (firwin2) — evita cascadear N filtros y
+    acumular N delays/errores de diseño por separado.
+    """
+    bands = [b for b in (bands or []) if b.get("gain_db", 0.0) != 0.0]
+    if not bands:
+        return audio
+    num_taps = int(num_taps)
+    if num_taps % 2 == 0:
+        num_taps += 1  # taps impares -> FIR simétrico Tipo I, fase lineal exacta
+
+    n_freqs = 4096
+    freqs_grid = np.linspace(0.0, sr / 2.0, n_freqs)
+    total_db = np.zeros(n_freqs)
+    for b in bands:
+        gain_db = float(b.get("gain_db", 0.0))
+        freq = float(np.clip(b.get("freq", 1000.0), 20.0, sr / 2.0 - 1.0))
+        btype = b.get("type", "peak")
+        if btype == "high_shelf":
+            sos = _design_high_shelf_sos(sr, freq, gain_db)
+        elif btype == "low_shelf":
+            sos = _design_low_shelf_sos(sr, freq, gain_db)
+        else:
+            q = float(np.clip(b.get("q", 1.0), 0.1, 30.0))
+            sos = _design_peaking_sos(sr, freq, gain_db, q)
+        _, h = sosfreqz(sos, worN=freqs_grid, fs=sr)
+        total_db += 20.0 * np.log10(np.abs(h) + 1e-12)
+
+    gain_lin = 10.0 ** (total_db / 20.0)
+    freq_norm = freqs_grid / (sr / 2.0)
+    freq_norm[-1] = 1.0
+    taps = firwin2(num_taps, freq_norm, gain_lin)
+
+    def _apply(ch):
+        # fftconvolve + mode='same' con FIR simétrico (impar) cancela el
+        # delay de grupo (num_taps-1)/2: el tap central queda alineado con
+        # t=0, dando salida sin corrimiento temporal audible.
+        return fftconvolve(ch, taps, mode='same')
+
+    if audio.ndim == 1:
+        return _apply(audio)
+    return np.stack([_apply(ch) for ch in audio])
+
+def detect_resonances(audio: np.ndarray, sr: int,
+                      min_freq: float = 120.0, max_freq: float = 9000.0,
+                      threshold_db: float = 4.0, max_resonances: int = 6) -> list:
+    """Detección de resonancias: busca picos ANGOSTOS que sobresalen del
+    perfil espectral general (baseline = mediana móvil en el propio
+    espectro promediado por Welch), no simplemente "la banda más alta" —
+    eso sería balance tonal, no resonancia. Cada resultado trae una
+    sugerencia de corte (Dynamic EQ / EQ estático) lista para aplicar con
+    dynamic_eq_band(freq=r['freq_hz'], q=r['suggested_q'], ...).
+    """
+    mono = audio.mean(axis=0) if audio.ndim == 2 else audio
+    n_fft = 8192
+    mag = _averaged_magnitude_spectrum(mono, n_fft)
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+    mag_db = 20.0 * np.log10(mag + 1e-12)
+
+    band_mask = (freqs >= min_freq) & (freqs <= max_freq)
+    idx = np.where(band_mask)[0]
+    if len(idx) < 10:
+        return []
+
+    win = max(5, (int(len(idx) * 0.03) | 1))  # ventana impar, ~3% del rango
+    baseline = median_filter(mag_db[idx], size=win)
+    excess = mag_db[idx] - baseline
+
+    peaks, props = find_peaks(excess, height=threshold_db, distance=max(3, win // 2))
+    results = []
+    for p, h in zip(peaks, props["peak_heights"]):
+        f = float(freqs[idx][p])
+        results.append({
+            "freq_hz": round(f, 1),
+            "excess_db": round(float(h), 2),
+            "suggested_cut_db": round(float(min(h * 0.7, 6.0)), 2),
+            "suggested_q": 4.0,
+        })
+    results.sort(key=lambda r: -r["excess_db"])
+    return results[:max_resonances]
+
+def detect_sibilance(audio: np.ndarray, sr: int,
+                     low_hz: float = 4000.0, high_hz: float = 9000.0,
+                     block_s: float = 0.05) -> dict:
+    """Detección de sibilancia: compara la envolvente de energía de la
+    banda 4-9kHz contra la envolvente de banda completa, cuadro a cuadro.
+    No basta con "hay mucha energía en agudos" (eso es balance tonal) — lo
+    que caracteriza la sibilancia son PICOS puntuales de esa banda por
+    encima de su propia mediana (las "eses"/"ches" sobresaliendo del resto
+    de la voz). suggested_reduction_db queda pensado para alimentar
+    dynamic_eq_band como de-esser (freq≈centro de la banda, Q ancho).
+    """
+    mono = audio.mean(axis=0) if audio.ndim == 2 else audio
+    high_hz = min(high_hz, sr / 2.0 - 1.0)
+    if high_hz <= low_hz:
+        return {"present": False, "band_hz": [low_hz, high_hz], "severity_db": 0.0,
+                "frames_flagged_pct": 0.0, "suggested_reduction_db": 0.0}
+
+    band = _bandpass_filter(mono, sr, low_hz, high_hz)
+    hop = max(1, int(sr * block_s))
+    n_blocks = max(1, len(mono) // hop)
+    band_env_db, full_env_db = [], []
+    for i in range(n_blocks):
+        seg_b = band[i * hop:(i + 1) * hop]
+        seg_f = mono[i * hop:(i + 1) * hop]
+        if len(seg_b) == 0:
+            continue
+        band_env_db.append(20.0 * np.log10(np.sqrt(np.mean(seg_b ** 2)) + 1e-9))
+        full_env_db.append(20.0 * np.log10(np.sqrt(np.mean(seg_f ** 2)) + 1e-9))
+    if not band_env_db:
+        return {"present": False, "band_hz": [low_hz, high_hz], "severity_db": 0.0,
+                "frames_flagged_pct": 0.0, "suggested_reduction_db": 0.0}
+
+    ratio_db = np.array(band_env_db) - np.array(full_env_db)
+    baseline = float(np.median(ratio_db))
+    spikes = ratio_db - baseline
+    flagged = spikes > 6.0
+    severity = float(np.mean(spikes[spikes > 0])) if np.any(spikes > 0) else 0.0
+    present = bool(np.mean(flagged) > 0.03 and severity > 3.0)
+
+    return {
+        "present": present,
+        "band_hz": [round(low_hz, 1), round(high_hz, 1)],
+        "severity_db": round(severity, 2),
+        "frames_flagged_pct": round(float(np.mean(flagged) * 100.0), 1),
+        "suggested_reduction_db": round(float(min(severity, 8.0)), 2),
+    }
+
+def dynamic_eq_band(audio: np.ndarray, sr: int,
+                    freq: float = 3000.0, q: float = 2.5,
+                    threshold_db: float = -18.0, ratio: float = 3.0,
+                    attack_ms: float = 3.0, release_ms: float = 80.0,
+                    max_reduction_db: float = 12.0, bypass: bool = True) -> tuple:
+    """Dynamic EQ de banda única: aísla una banda angosta (freq/Q) con un
+    bandpass de fase cero, comprime HACIA ABAJO solo esa banda cuando su
+    envolvente supera threshold_db, y la recombina con el resto de la señal
+    intacto (residual = señal - banda; salida = residual + banda_comprimida).
+
+    Es un bloque GENÉRICO: con Q alto en la frecuencia de una resonancia
+    detectada actúa como de-resonador; con freq≈6500Hz y Q ancho actúa como
+    de-esser. No son dos herramientas separadas, son el mismo mecanismo
+    apuntado a distintas zonas — así lo pedía el ítem "Dynamic EQ en
+    algunas zonas" + "reducción de resonancias" + "detección de
+    sibilancias" del pedido.
+    """
+    if bypass or max_reduction_db <= 0.0:
+        return audio, {"bypass": True, "gr_db": 0.0}
+
+    freq = float(np.clip(freq, 20.0, sr / 2.0 - 1.0))
+    q = float(np.clip(q, 0.3, 30.0))
+    bw = freq / q
+    lo = max(20.0, freq - bw / 2.0)
+    hi = min(sr / 2.0 - 1.0, freq + bw / 2.0)
+    if hi <= lo:
+        return audio, {"bypass": True, "gr_db": 0.0}
+
+    def process_channel(ch):
+        band = _bandpass_filter(ch, sr, lo, hi)
+        residual = ch - band
+        env = _smooth_envelope(np.abs(band), sr, attack_ms, release_ms)
+        env_db = 20.0 * np.log10(env + 1e-9)
+        gr_db = _soft_knee_gain_reduction_np(env_db, threshold_db, ratio)
+        gr_db = np.maximum(gr_db, -max_reduction_db)
+        band_out = band * (10.0 ** (gr_db / 20.0))
+        return residual + band_out, gr_db
+
+    if audio.ndim == 1:
+        out, gr_db = process_channel(audio)
+    else:
+        outs, grs = [], []
+        for ch in audio:
+            o, g = process_channel(ch)
+            outs.append(o)
+            grs.append(g)
+        out = np.stack(outs)
+        gr_db = np.mean(np.stack(grs), axis=0)
+
+    tail = max(1, sr // 8)
+    meter = {
+        "bypass": False,
+        "freq_hz": round(freq, 1),
+        "q": round(q, 2),
+        "band_range_hz": [round(lo, 1), round(hi, 1)],
+        "gr_db": round(float(np.mean(gr_db[-tail:])), 2),
+    }
+    return out, meter
 
 def transient_shaper(audio: np.ndarray, sr: int,
                      attack_amount: float = 0.0, sustain_amount: float = 0.0,
@@ -816,6 +1090,9 @@ def analyze_audio(audio: np.ndarray, sr: int) -> dict:
         # ── Espectro ─────────────────────────────────────────────────────
         "spectrum":           spectrum,
         "fft_spectrum":       spectrum_analysis_fft(audio, sr),
+        # ── Resonancias / sibilancia (para Dynamic EQ / de-esser) ────────
+        "resonances":         detect_resonances(audio, sr),
+        "sibilance":          detect_sibilance(audio, sr),
     }
 
 # ─── Consejos de mezcla ───────────────────────────────────────────────────────
@@ -1601,6 +1878,18 @@ def apply_mastering_chain(
     glue_makeup_db: float = 0.0,
     limiter_ceiling: float = 0.95,
     limiter_release_ms: float = 80.0,
+    eq_mode: str = "iir",              # "iir" (zero-phase, actual) | "linear_phase" (FIR)
+    linear_phase_taps: int = 2049,
+    low_end_mono_freq: float = 120.0,
+    low_end_mono_amount: float = 0.0,  # 0 = bypass (comportamiento anterior sin cambios)
+    dyneq_bypass: bool = True,
+    dyneq_freq: float = 3000.0,
+    dyneq_q: float = 2.5,
+    dyneq_threshold_db: float = -18.0,
+    dyneq_ratio: float = 3.0,
+    dyneq_attack_ms: float = 3.0,
+    dyneq_release_ms: float = 80.0,
+    dyneq_max_reduction_db: float = 12.0,
     **_ignored,
 ) -> tuple:
     """
@@ -1636,19 +1925,54 @@ def apply_mastering_chain(
     # ── 1. High-pass (fase cero) ──────────────────────────────────────────
     audio = eq_high_pass(audio, sr, cutoff_hz=hp_cutoff)
 
-    # ── 2. EQ paramétrico (4 bandas, opcional banda por banda) ────────────
-    for freq, gain, q in [
-        (eq1_freq, eq1_gain, eq1_q),
-        (eq2_freq, eq2_gain, eq2_q),
-        (eq3_freq, eq3_gain, eq3_q),
-        (eq4_freq, eq4_gain, eq4_q),
-    ]:
-        if gain != 0.0:
-            audio = eq_parametric_band(audio, sr, freq=freq, gain_db=gain, q=q)
+    # ── 2. EQ paramétrico (4 bandas + high shelf, opcional banda por banda) ─
+    # Dos modos, elegidos por eq_mode:
+    #   "iir"          -> como antes: cada banda es un biquad RBJ aplicado
+    #                     con sosfiltfilt (fase cero, cascada banda a banda).
+    #   "linear_phase" -> las bandas activas se combinan en UNA sola curva
+    #                     de magnitud y se aplican con un único FIR de fase
+    #                     lineal (linear_phase_eq), delay de grupo constante
+    #                     y verificable en toda la banda.
+    if str(eq_mode).lower() == "linear_phase":
+        lp_bands = []
+        for freq, gain, q in [
+            (eq1_freq, eq1_gain, eq1_q),
+            (eq2_freq, eq2_gain, eq2_q),
+            (eq3_freq, eq3_gain, eq3_q),
+            (eq4_freq, eq4_gain, eq4_q),
+        ]:
+            if gain != 0.0:
+                lp_bands.append({"type": "peak", "freq": freq, "gain_db": gain, "q": q})
+        if high_shelf_gain_db != 0.0:
+            lp_bands.append({"type": "high_shelf", "freq": high_shelf_freq_hz, "gain_db": high_shelf_gain_db})
+        if lp_bands:
+            audio = linear_phase_eq(audio, sr, lp_bands, num_taps=linear_phase_taps)
+    else:
+        for freq, gain, q in [
+            (eq1_freq, eq1_gain, eq1_q),
+            (eq2_freq, eq2_gain, eq2_q),
+            (eq3_freq, eq3_gain, eq3_q),
+            (eq4_freq, eq4_gain, eq4_q),
+        ]:
+            if gain != 0.0:
+                audio = eq_parametric_band(audio, sr, freq=freq, gain_db=gain, q=q)
 
-    # High shelf (opcional) — freq variable
-    if high_shelf_gain_db != 0.0:
-        audio = eq_high_shelf(audio, sr, cutoff_hz=high_shelf_freq_hz, gain_db=high_shelf_gain_db)
+        # High shelf (opcional) — freq variable
+        if high_shelf_gain_db != 0.0:
+            audio = eq_high_shelf(audio, sr, cutoff_hz=high_shelf_freq_hz, gain_db=high_shelf_gain_db)
+
+    # ── 2b. Dynamic EQ de banda única (opcional, bypass por defecto) ───────
+    # Va ACÁ (después del EQ estático, antes de la dinámica de nivel) porque
+    # es correctiva sobre el timbre/resonancias — igual que el resto de la
+    # EQ — y tiene que actuar antes de que el compresor de banda ancha vea
+    # la señal, si no la resonancia ya afectó la detección de nivel.
+    audio, dyneq_meters = dynamic_eq_band(
+        audio, sr,
+        freq=dyneq_freq, q=dyneq_q,
+        threshold_db=dyneq_threshold_db, ratio=dyneq_ratio,
+        attack_ms=dyneq_attack_ms, release_ms=dyneq_release_ms,
+        max_reduction_db=dyneq_max_reduction_db, bypass=dyneq_bypass,
+    )
 
     # ── 3. Transient shaper (opcional, ANTES de comprimir) ─────────────────
     if transient_attack != 0.0 or transient_sustain != 0.0:
@@ -1736,6 +2060,13 @@ def apply_mastering_chain(
         elif stereo_width_amount != 1.0:
             audio = stereo_width(audio, width=stereo_width_amount)
 
+    # ── 8b2. Low-End Mono Maker DEDICADO (opcional, bypass por defecto) ────
+    # Independiente del bass_mono_freq fijo que ya trae stereo_enhancer:
+    # este permite mono parcial (0..1) y se puede usar aunque no se use el
+    # enhancer (p.ej. con stereo_width simple).
+    if audio.shape[0] == 2 and low_end_mono_amount > 0.0:
+        audio = low_end_mono_maker(audio, sr, freq=low_end_mono_freq, mono_amount=low_end_mono_amount)
+
     # ── 8c. Multiband Stereo Width (opcional, bypass por defecto) ──────────
     if audio.shape[0] == 2 and not mb_stereo_bypass:
         audio = multiband_stereo_width(
@@ -1774,6 +2105,7 @@ def apply_mastering_chain(
         "comp": comp_meters,
         "glue": glue_meters,
         "mb": mb_meters,
+        "dyneq": dyneq_meters,
         "pre_limiter":  {"rms_db": round(pre_rms_db, 2),  "peak_db": round(pre_peak_db, 2)},
         "post_limiter": {
             "rms_db":             round(post_rms_db, 2),
@@ -1852,6 +2184,18 @@ def process_audio(
     glue_makeup_db: float = 0.0,
     limiter_ceiling: float = 0.95,
     limiter_release_ms: float = 80.0,
+    eq_mode: str = "iir",
+    linear_phase_taps: int = 2049,
+    low_end_mono_freq: float = 120.0,
+    low_end_mono_amount: float = 0.0,
+    dyneq_bypass: bool = True,
+    dyneq_freq: float = 3000.0,
+    dyneq_q: float = 2.5,
+    dyneq_threshold_db: float = -18.0,
+    dyneq_ratio: float = 3.0,
+    dyneq_attack_ms: float = 3.0,
+    dyneq_release_ms: float = 80.0,
+    dyneq_max_reduction_db: float = 12.0,
     output_format: str = "wav",
     preview_seconds: float = None,
     platform_target: str = None,
@@ -1939,7 +2283,109 @@ def process_audio(
         glue_makeup_db=glue_makeup_db,
         limiter_ceiling=limiter_ceiling,
         limiter_release_ms=limiter_release_ms,
+        eq_mode=eq_mode,
+        linear_phase_taps=linear_phase_taps,
+        low_end_mono_freq=low_end_mono_freq,
+        low_end_mono_amount=low_end_mono_amount,
+        dyneq_bypass=dyneq_bypass,
+        dyneq_freq=dyneq_freq,
+        dyneq_q=dyneq_q,
+        dyneq_threshold_db=dyneq_threshold_db,
+        dyneq_ratio=dyneq_ratio,
+        dyneq_attack_ms=dyneq_attack_ms,
+        dyneq_release_ms=dyneq_release_ms,
+        dyneq_max_reduction_db=dyneq_max_reduction_db,
     )
+
+    # ── BUGFIX (LUFS safety check nunca se activaba) ───────────────────────
+    # `use_lufs_normalize`/`target_lufs` se aceptaban en toda la API (presets,
+    # /master, ws_master_stream al elegir plataforma...) pero apply_mastering_chain
+    # los recibía y los IGNORABA por completo (quedaban comentados "No se usa" /
+    # "Ignorado"): el flag prendía en la UI pero no disparaba ninguna corrección
+    # real, así que el loudness final quedaba a la suerte de lo que el
+    # compresor/limiter dieran, sin ninguna red de seguridad.
+    #
+    # Ahora, si use_lufs_normalize=True, se mide el LUFS realmente logrado por
+    # la cadena YA renderizada (chain_meters['post_limiter']['lufs']) y, si se
+    # desvía del target más allá de la tolerancia, se corrige input_gain_db y
+    # se re-renderiza la cadena completa (el nivel de entrada afecta cómo
+    # reaccionan compresor/limiter, así que un simple trim de salida post-hoc
+    # no sirve) — converge en pocas iteraciones, igual mecanismo que usa Laia
+    # en la Fase 4 de auto-mastering, pero acá queda disponible para CUALQUIER
+    # endpoint que pase por process_audio, no solo el de IA.
+    lufs_safety_notes = []
+    if use_lufs_normalize:
+        max_iters = 4
+        tolerance_db = 0.3
+        current_input_gain = input_gain_db
+        for i in range(max_iters):
+            achieved = chain_meters.get("post_limiter", {}).get("lufs")
+            if achieved is None:
+                break
+            delta = float(target_lufs) - float(achieved)
+            if abs(delta) <= tolerance_db:
+                lufs_safety_notes.append(
+                    f"LUFS safety check: {achieved:.2f} LUFS vs. objetivo {target_lufs:.2f} LUFS "
+                    f"(dentro de tolerancia, sin corrección adicional)."
+                )
+                break
+            new_input_gain = float(np.clip(current_input_gain + delta, -24.0, 24.0))
+            if abs(new_input_gain - current_input_gain) < 0.05:
+                lufs_safety_notes.append(
+                    f"LUFS safety check: no se pudo alcanzar {target_lufs:.2f} LUFS sin exceder "
+                    f"el rango de input_gain_db (quedó en {achieved:.2f} LUFS)."
+                )
+                break
+            current_input_gain = new_input_gain
+            audio_retry, chain_meters_retry = apply_mastering_chain(
+                _load_audio_any(input_path)[0] if False else audio_orig, sr,
+                target_peak=target_peak, use_lufs_normalize=use_lufs_normalize, target_lufs=target_lufs,
+                input_gain_db=current_input_gain, oversample_mode=oversample_mode, comp_stereo_link=comp_stereo_link,
+                comp_threshold=comp_threshold, comp_ratio=comp_ratio, comp_attack_ms=comp_attack_ms,
+                comp_release_ms=comp_release_ms, comp_makeup_db=comp_makeup_db,
+                mb_low_crossover=mb_low_crossover, mb_high_crossover=mb_high_crossover,
+                mb_low_threshold=mb_low_threshold, mb_low_ratio=mb_low_ratio, mb_low_attack_ms=mb_low_attack_ms,
+                mb_low_release_ms=mb_low_release_ms, mb_low_makeup_db=mb_low_makeup_db,
+                mb_mid_threshold=mb_mid_threshold, mb_mid_ratio=mb_mid_ratio, mb_mid_attack_ms=mb_mid_attack_ms,
+                mb_mid_release_ms=mb_mid_release_ms, mb_mid_makeup_db=mb_mid_makeup_db,
+                mb_high_threshold=mb_high_threshold, mb_high_ratio=mb_high_ratio, mb_high_attack_ms=mb_high_attack_ms,
+                mb_high_release_ms=mb_high_release_ms, mb_high_makeup_db=mb_high_makeup_db,
+                mb_bypass=mb_bypass, hp_cutoff=hp_cutoff, high_shelf_gain_db=high_shelf_gain_db,
+                high_shelf_freq_hz=high_shelf_freq_hz, mb_stereo_bypass=mb_stereo_bypass,
+                mb_stereo_low_width=mb_stereo_low_width, mb_stereo_mid_width=mb_stereo_mid_width,
+                mb_stereo_high_width=mb_stereo_high_width, mb_stereo_low_crossover=mb_stereo_low_crossover,
+                mb_stereo_high_crossover=mb_stereo_high_crossover,
+                eq1_freq=eq1_freq, eq1_gain=eq1_gain, eq1_q=eq1_q,
+                eq2_freq=eq2_freq, eq2_gain=eq2_gain, eq2_q=eq2_q,
+                eq3_freq=eq3_freq, eq3_gain=eq3_gain, eq3_q=eq3_q,
+                eq4_freq=eq4_freq, eq4_gain=eq4_gain, eq4_q=eq4_q,
+                transient_attack=transient_attack, transient_sustain=transient_sustain,
+                saturation_drive=saturation_drive, saturation_mode=saturation_mode, saturation_mix=saturation_mix,
+                mid_gain_db=mid_gain_db, side_gain_db=side_gain_db, stereo_width_amount=stereo_width_amount,
+                use_stereo_enhancer=use_stereo_enhancer, enhancer_bass_mono_freq=enhancer_bass_mono_freq,
+                haas_delay_ms=haas_delay_ms, reverb_size=reverb_size, reverb_wet=reverb_wet,
+                glue_bypass=glue_bypass, glue_threshold_db=glue_threshold_db, glue_ratio=glue_ratio,
+                glue_attack_ms=glue_attack_ms, glue_release_ms=glue_release_ms, glue_makeup_db=glue_makeup_db,
+                limiter_ceiling=limiter_ceiling, limiter_release_ms=limiter_release_ms,
+                eq_mode=eq_mode, linear_phase_taps=linear_phase_taps,
+                low_end_mono_freq=low_end_mono_freq, low_end_mono_amount=low_end_mono_amount,
+                dyneq_bypass=dyneq_bypass, dyneq_freq=dyneq_freq, dyneq_q=dyneq_q,
+                dyneq_threshold_db=dyneq_threshold_db, dyneq_ratio=dyneq_ratio, dyneq_attack_ms=dyneq_attack_ms,
+                dyneq_release_ms=dyneq_release_ms, dyneq_max_reduction_db=dyneq_max_reduction_db,
+            )
+            audio, chain_meters = audio_retry, chain_meters_retry
+            lufs_safety_notes.append(
+                f"LUFS safety check #{i + 1}: {achieved:.2f} LUFS vs. objetivo {target_lufs:.2f} LUFS "
+                f"→ input_gain_db corregido a {current_input_gain:+.2f} dB."
+            )
+        chain_meters["lufs_safety"] = {
+            "enabled": True,
+            "target_lufs": round(float(target_lufs), 2),
+            "final_input_gain_db": round(current_input_gain, 2),
+            "notes": lufs_safety_notes,
+        }
+    else:
+        chain_meters["lufs_safety"] = {"enabled": False}
 
     analysis_after = analyze_audio(audio, sr)
 
