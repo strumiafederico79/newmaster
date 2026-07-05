@@ -48,3 +48,12 @@ def test_advanced_dsp_mode_is_exposed_to_the_assistant():
 
     params = result["suggested_params"]
     assert params["eq_mode"] == "linear_phase"
+
+
+def test_boolean_dsp_blocks_are_exposed_to_the_assistant():
+    analysis = {}
+
+    result = build_fallback_response("desactiva el glue compressor", analysis)
+
+    params = result["suggested_params"]
+    assert params["glue_bypass"] is True
